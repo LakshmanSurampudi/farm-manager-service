@@ -204,8 +204,21 @@ async def scheme_node(state):
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 SCHEME_SERVICE_URL,
-                json={"query": query},
-                timeout=30.0
+                json={
+                    "query": f"""
+                You are an expert on ANDHRA PRADESH agricultural government schemes ONLY.
+
+                STRICT RULES:
+                - Answer ONLY for Andhra Pradesh.
+                - Answer ONLY for PADDY (RICE).
+                - IGNORE citrus, mosambi, and horticulture-only schemes.
+                - If a scheme does not apply to paddy, say so clearly.
+                - Do NOT hallucinate applicability.
+
+                Farmer question:
+                {query}
+                """
+                },timeout=30.0
             )
             response.raise_for_status()
             scheme_response = response.json()
@@ -242,8 +255,22 @@ async def crop_node(state):
             else:
                 url = CROP_TEXT_SERVICE_URL
                 payload = {
-                    "query": query
+                    "query": f"""
+                You are an agricultural crop advisor.
+
+                STRICT RULES:
+                - DO NOT mention government schemes, subsidies, insurance, or finances.
+                - Focus ONLY on crop symptoms, causes, and immediate agronomic steps.
+                - If diagnosis is uncertain without an image, say so clearly.
+
+                Crop: Paddy (Rice)
+                Location: Andhra Pradesh
+
+                Farmer query:
+                {query}
+                """
                 }
+
                 # ask-consultant is TEXT ONLY
                 response = await client.post(
                     url,
@@ -275,6 +302,10 @@ def collector_node(state):
     scheme_response = state.get("scheme_response")
     crop_response = state.get("crop_response")
     
+    if intent in ("crop", "both") and crop_response:
+        crop_response = sanitize_crop_response(crop_response)
+
+
     # Ensure responses were generated
     if intent == "scheme":
         if scheme_response is None:
@@ -319,6 +350,18 @@ def route_from_scheme(state):
     if intent == "both":
         return "crop_node"
     return "collector"
+
+def sanitize_crop_response(resp: dict) -> dict:
+    text = (resp.get("response") or "").lower()
+    forbidden = ["scheme", "subsidy", "yojana", "insurance", "pmfby"]
+
+    if any(word in text for word in forbidden):
+        return {
+            "warning": "Crop advisory unavailable due to irrelevant data.",
+            "suggestion": "Please upload a clear crop image for accurate diagnosis."
+        }
+
+    return resp
 
 # Build graph
 workflow = StateGraph(FarmerState)
