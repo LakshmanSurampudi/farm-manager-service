@@ -203,95 +203,181 @@ Respond with ONLY one word: scheme, crop, both, or none."""
         traceback.print_exc()
         return {**state, "intent": None, "entities": {}, "service_response": {"error": "Gemini classification failed"}}
 
+
 async def scheme_node(state):
     query = state.get("text", "")
     print(f"in scheme node. query: {query}")
-    
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 SCHEME_SERVICE_URL,
                 json={
                     "query": f"""
-                You are an expert on ANDHRA PRADESH agricultural government schemes ONLY.
+You are an expert on ANDHRA PRADESH agricultural government schemes.
 
-                STRICT RULES:
-                - Answer ONLY for Andhra Pradesh.
-                - Answer ONLY for PADDY (RICE).
-                - IGNORE citrus, mosambi, and horticulture-only schemes.
-                - If a scheme does not apply to paddy, say so clearly.
-                - Do NOT hallucinate applicability.
+STRICT RULES:
+- Answer ONLY for Andhra Pradesh.
+- If the farmer mentions a specific crop, prioritize schemes applicable to that crop.
+- If no crop is mentioned, list relevant GENERAL agricultural schemes.
+- If a scheme is crop-specific, clearly state which crops it applies to.
+- If a scheme does NOT apply to the farmer’s crop, explicitly say so.
+- Do NOT hallucinate applicability.
 
-                Farmer question:
-                {query}
-                """
-                },timeout=30.0
+Farmer question:
+{query}
+"""
+                },
+                timeout=30.0
             )
             response.raise_for_status()
             scheme_response = response.json()
+
     except Exception as e:
         scheme_response = {"error": str(e)}
-    
+
     return {**state, "scheme_response": scheme_response}
 
-async def crop_node(state):
-    query = state.get("text", "")
-    image_url = state.get("imageUrl")
-    print(f"in crop node. query: {query}, imageUrl: {image_url}")
+import asyncio
+import httpx
 
-    # 🔽🔽🔽 CHANGE START: decide modality 🔽🔽🔽
+
+def normalize_crop_output(raw: dict) -> dict:
+    """
+    Normalize backend schema differences.
+    Backend may return: { "answer": ... } or { "response": ... }
+    Internally we ALWAYS use: { "response": ... }
+    """
+    if not isinstance(raw, dict):
+        return {"response": str(raw)}
+
+    if "response" in raw:
+        return raw
+
+    if "answer" in raw:
+        raw["response"] = raw.pop("answer")
+        return raw
+
+    return {"response": str(raw)}
+
+
+async def post_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    data: dict | None = None,
+    json: dict | None = None,
+    retries: int = 3,
+    base_delay: float = 1.5,
+):
+    """
+    Retry wrapper to handle transient network failures.
+    """
+    last_exc = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            return await client.post(
+                url,
+                data=data,
+                json=json,
+                timeout=httpx.Timeout(30.0, connect=10.0),
+            )
+        except httpx.ConnectError as e:
+            last_exc = e
+            print(
+                f"[Crop Node] Connection attempt {attempt}/{retries} failed. Retrying..."
+            )
+            if attempt < retries:
+                await asyncio.sleep(base_delay * attempt)
+
+    raise last_exc
+
+
+async def crop_node(state):
+    query = (state.get("text") or "").strip()
+    image_url = state.get("imageUrl")
+    print(f"[Crop Node] query={query!r}, imageUrl={image_url!r}")
+
     use_image = bool(image_url and image_url.startswith(("http://", "https://")))
-    # 🔼🔼🔼 CHANGE END 🔼🔼🔼
+
+    # Ensure non-empty query for image analysis
+    if use_image and not query:
+        query = (
+            "Analyze the crop shown in the image and identify possible diseases, "
+            "nutrient deficiencies, or pest issues. Provide actionable treatment advice."
+        )
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(
+            headers={
+                # Explicit headers reduce proxy / TLS weirdness on Windows
+                "User-Agent": "farm-manager-service/1.0",
+                "Accept": "application/json",
+            }
+        ) as client:
 
-            # 🔽🔽🔽 CHANGE START: route to correct endpoint 🔽🔽🔽
             if use_image:
-                url = CROP_IMAGE_SERVICE_URL
-                payload = {
-                    "query": query,
-                    "mediaUrl": image_url
-                }
-                # ask-with-image expects form-style or JSON depending on backend
-                response = await client.post(
-                    url,
-                    json=payload,  # switched to JSON for consistency
-                    timeout=30.0
+                # 🔒 ask-with-image → multipart/form-data ONLY
+                response = await post_with_retry(
+                    client,
+                    CROP_IMAGE_SERVICE_URL,
+                    data={
+                        "query": query,
+                        "mediaUrl": image_url,
+                    },
                 )
             else:
-                url = CROP_TEXT_SERVICE_URL
-                payload = {
-                    "query": f"""
-                You are an agricultural crop advisor.
+                # Text-only crop advisory
+                response = await post_with_retry(
+                    client,
+                    CROP_TEXT_SERVICE_URL,
+                    json={
+                        "query": f"""
+You are an agricultural crop advisor.
 
-                STRICT RULES:
-                - DO NOT mention government schemes, subsidies, insurance, or finances.
-                - Focus ONLY on crop symptoms, causes, and immediate agronomic steps.
-                - If diagnosis is uncertain without an image, say so clearly.
+STRICT RULES:
+- Answer for ANY crop unless explicitly specified otherwise.
+- DO NOT mention government schemes, subsidies, insurance, or finances.
+- Focus ONLY on crop symptoms, causes, and immediate agronomic steps.
+- If the crop is unclear, ask a clarification question.
+- If diagnosis is uncertain without an image, say so clearly.
 
-                Crop: Paddy (Rice)
-                Location: Andhra Pradesh
-
-                Farmer query:
-                {query}
-                """
-                }
-
-                # ask-consultant is TEXT ONLY
-                response = await client.post(
-                    url,
-                    json=payload,
-                    timeout=30.0
+Farmer query:
+{query}
+"""
+                    },
                 )
-            # 🔼🔼🔼 CHANGE END 🔼🔼🔼
 
             response.raise_for_status()
-            crop_response = response.json()
+
+            try:
+                raw = response.json()
+            except Exception:
+                return {
+                    **state,
+                    "crop_response": {
+                        "error": "Crop service returned invalid JSON."
+                    },
+                }
+
+            crop_response = normalize_crop_output(raw)
+
+    except httpx.ConnectError:
+        # Network-level failure (service down / DNS / firewall)
+        crop_response = {
+            "error": "Crop image service is currently unreachable. Please try again shortly."
+        }
+
+    except httpx.HTTPStatusError as e:
+        crop_response = {
+            "error": f"Crop service returned HTTP {e.response.status_code}"
+        }
 
     except Exception as e:
         import traceback
-        print(f"[Crop Node] Error calling crop service: {e}")
+
+        print("[Crop Node] Unexpected error:")
         traceback.print_exc()
         crop_response = {"error": str(e)}
 
